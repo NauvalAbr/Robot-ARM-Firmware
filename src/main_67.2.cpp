@@ -170,6 +170,27 @@ Encoder J6encPos(40, 41); //24, 25
 
 ModbusMaster node;
 
+// Force sensor node over custom RS485 packets on Serial8.
+// Packet format: $FZ,<seq>,<ms>,<raw>,<gram>,<newton>,<status>*<xor>
+static const unsigned long FORCE_RS485_BAUD = 57600;
+static const int FORCE_RS485_DE_RE_PIN = -1;  // Set to a Teensy pin if the RS485 module needs DE/RE control.
+static char forcePayloadBuffer[128];
+static char forceChecksumBuffer[3];
+static uint8_t forcePayloadLength = 0;
+static uint8_t forceChecksumLength = 0;
+static bool forceFrameActive = false;
+static bool forceChecksumActive = false;
+static bool forcePacketReady = false;
+static uint32_t forceSeq = 0;
+static uint32_t forceSensorMillis = 0;
+static unsigned long forceLastPacketMillis = 0;
+static long forceRaw = 0;
+static float forceGram = 0.0f;
+static float forceNewton = 0.0f;
+static String forceStatus = "NO_DATA";
+static String forceLastAck = "NONE";
+static uint32_t forceChecksumErrors = 0;
+
 
 // GLOBAL VARS //
 
@@ -2860,6 +2881,177 @@ int32_t modbusQuerry(String inData, int function) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// FORCE SENSOR RS485 CUSTOM PACKET
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint8_t forceXorChecksum(const char *payload) {
+  uint8_t crc = 0;
+  while (*payload != '\0') {
+    crc ^= static_cast<uint8_t>(*payload++);
+  }
+  return crc;
+}
+
+int forceHexValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+bool forceParseHexByte(const char *text, uint8_t &value) {
+  int high = forceHexValue(text[0]);
+  int low = forceHexValue(text[1]);
+  if (high < 0 || low < 0) {
+    return false;
+  }
+  value = static_cast<uint8_t>((high << 4) | low);
+  return true;
+}
+
+void forceSetTransmit(bool enabled) {
+  if (FORCE_RS485_DE_RE_PIN >= 0) {
+    digitalWrite(FORCE_RS485_DE_RE_PIN, enabled ? HIGH : LOW);
+  }
+}
+
+void sendForceRs485Payload(const char *payload) {
+  char packet[128];
+  snprintf(packet, sizeof(packet), "$%s*%02X\n", payload, forceXorChecksum(payload));
+  forceSetTransmit(true);
+  delayMicroseconds(20);
+  Serial8.print(packet);
+  Serial8.flush();
+  delayMicroseconds(20);
+  forceSetTransmit(false);
+}
+
+void sendForceCommand(const String &command) {
+  char payload[96];
+  command.toCharArray(payload, sizeof(payload));
+  sendForceRs485Payload(payload);
+}
+
+String forceField(const String &payload, int fieldIndex) {
+  int start = 0;
+  int end = -1;
+  for (int i = 0; i <= fieldIndex; ++i) {
+    start = end + 1;
+    end = payload.indexOf(',', start);
+    if (end < 0) {
+      end = payload.length();
+    }
+  }
+  return payload.substring(start, end);
+}
+
+void handleForcePayload(const char *payload) {
+  String data = String(payload);
+
+  if (data.startsWith("FZ,")) {
+    forceSeq = static_cast<uint32_t>(forceField(data, 1).toInt());
+    forceSensorMillis = static_cast<uint32_t>(forceField(data, 2).toInt());
+    forceRaw = forceField(data, 3).toInt();
+    forceGram = forceField(data, 4).toFloat();
+    forceNewton = forceField(data, 5).toFloat();
+    forceStatus = forceField(data, 6);
+    forceLastPacketMillis = millis();
+    forcePacketReady = true;
+    return;
+  }
+
+  if (data.startsWith("FACK,")) {
+    forceLastAck = data.substring(5);
+    forceLastPacketMillis = millis();
+    return;
+  }
+}
+
+void resetForceParser() {
+  forcePayloadLength = 0;
+  forceChecksumLength = 0;
+  forceFrameActive = false;
+  forceChecksumActive = false;
+}
+
+void handleForceFrame() {
+  forcePayloadBuffer[forcePayloadLength] = '\0';
+  forceChecksumBuffer[forceChecksumLength] = '\0';
+
+  uint8_t received = 0;
+  if (forceChecksumLength != 2 || !forceParseHexByte(forceChecksumBuffer, received)) {
+    forceChecksumErrors++;
+    return;
+  }
+
+  if (received != forceXorChecksum(forcePayloadBuffer)) {
+    forceChecksumErrors++;
+    return;
+  }
+
+  handleForcePayload(forcePayloadBuffer);
+}
+
+void pollForceSerial() {
+  while (Serial8.available() > 0) {
+    char c = static_cast<char>(Serial8.read());
+
+    if (c == '$') {
+      resetForceParser();
+      forceFrameActive = true;
+      continue;
+    }
+
+    if (!forceFrameActive) {
+      continue;
+    }
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      if (forceChecksumActive) {
+        handleForceFrame();
+      }
+      resetForceParser();
+      continue;
+    }
+
+    if (c == '*') {
+      forceChecksumActive = true;
+      continue;
+    }
+
+    if (forceChecksumActive) {
+      if (forceChecksumLength < sizeof(forceChecksumBuffer) - 1) {
+        forceChecksumBuffer[forceChecksumLength++] = c;
+      }
+    } else if (forcePayloadLength < sizeof(forcePayloadBuffer) - 1) {
+      forcePayloadBuffer[forcePayloadLength++] = c;
+    }
+  }
+}
+
+void sendForceStatusToGui() {
+  unsigned long age = forcePacketReady ? millis() - forceLastPacketMillis : 0;
+  Serial.print("FZ,");
+  Serial.print(forceRaw);
+  Serial.print(",");
+  Serial.print(forceGram, 2);
+  Serial.print(",");
+  Serial.print(forceNewton, 4);
+  Serial.print(",");
+  Serial.print(forceStatus);
+  Serial.print(",");
+  Serial.print(age);
+  Serial.print(",");
+  Serial.print(forceLastAck);
+  Serial.print(",");
+  Serial.println(forceChecksumErrors);
+}
 void processSerial() {
   if (Serial.available() > 0 and cmdBuffer3 == "") {
     char recieved = Serial.read();
@@ -2958,14 +3150,17 @@ void EstopProg() {
 void setup() {
   // run once:
   Serial.begin(9600);
-  Serial8.begin(38400);  // Use Serial8 (pins 34 and 35)
+  Serial8.begin(FORCE_RS485_BAUD);  // Custom RS485 force sensor bus (pins 34 and 35)
   // There is no Serial.print before this line
   load_debug_from_eeprom();
   load_robot_id_from_eeprom();
 
 
-  // Initialize Modbus communication
-  node.begin(1, Serial8);
+  // Serial8 is reserved for the custom RS485 force sensor link.
+  if (FORCE_RS485_DE_RE_PIN >= 0) {
+    pinMode(FORCE_RS485_DE_RE_PIN, OUTPUT);
+    forceSetTransmit(false);
+  }
 
   pinMode(J1stepPin, OUTPUT);
   pinMode(J1dirPin, OUTPUT);
@@ -3026,6 +3221,8 @@ void loop() {
   ////////////////////////////////////
   ///////////start loop///////////////
 
+  pollForceSerial();
+
   if (splineEndReceived == false) {
     processSerial();
   }
@@ -3048,6 +3245,51 @@ void loop() {
     if (function == "RB") {
       Serial.println("System Restarting");
       reboot();
+    }
+    if (function == "FQ") {
+      sendForceStatusToGui();
+    }
+
+    if (function == "FT") {
+      sendForceCommand("FCMD,TARE");
+      Serial.println("Force Tare Sent");
+    }
+
+    if (function == "FC") {
+      String knownGram = inData;
+      knownGram.trim();
+      if (knownGram == "") {
+        Serial.println("Force Cal Error");
+      } else {
+        sendForceCommand("FCMD,CAL," + knownGram);
+        Serial.println("Force Cal Sent");
+      }
+    }
+
+    if (function == "FF") {
+      String factor = inData;
+      factor.trim();
+      if (factor == "") {
+        Serial.println("Force Factor Error");
+      } else {
+        sendForceCommand("FCMD,SETFACTOR," + factor);
+        Serial.println("Force Factor Sent");
+      }
+    }
+
+    if (function == "FP") {
+      String enabled = inData;
+      enabled.trim();
+      if (enabled == "") {
+        enabled = "1";
+      }
+      sendForceCommand("FCMD,STREAM," + enabled);
+      Serial.println("Force Stream Sent");
+    }
+
+    if (function == "FE") {
+      sendForceCommand("FCMD,ERASE");
+      Serial.println("Force Erase Sent");
     }
 
     if (function == "DB") {
@@ -6952,3 +7194,4 @@ void loop() {
     shiftCMDarray();
   }
 }
+
