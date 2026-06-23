@@ -85,6 +85,7 @@ const char *FIRMWARE_VERSION = "6.7.1";
 #include <stdexcept>
 #include <ModbusMaster.h>
 #include <EEPROM.h>
+#include "HX711.h"
 #pragma GCC diagnostic ignored "-Warray-bounds"
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wsequence-point"
@@ -170,26 +171,36 @@ Encoder J6encPos(40, 41); //24, 25
 
 ModbusMaster node;
 
-// Force sensor node over custom RS485 packets on Serial8.
-// Packet format: $FZ,<seq>,<ms>,<raw>,<gram>,<newton>,<status>*<xor>
-static const unsigned long FORCE_RS485_BAUD = 57600;
-static const int FORCE_RS485_DE_RE_PIN = -1;  // Set to a Teensy pin if the RS485 module needs DE/RE control.
-static char forcePayloadBuffer[128];
-static char forceChecksumBuffer[3];
-static uint8_t forcePayloadLength = 0;
-static uint8_t forceChecksumLength = 0;
-static bool forceFrameActive = false;
-static bool forceChecksumActive = false;
-static bool forcePacketReady = false;
-static uint32_t forceSeq = 0;
-static uint32_t forceSensorMillis = 0;
-static unsigned long forceLastPacketMillis = 0;
+// Direct HX711 force sensor on Teensy. Keep the HX711 module at 3.3 V logic for Teensy pins.
+static const uint8_t FORCE_HX711_DOUT_PIN = 34;
+static const uint8_t FORCE_HX711_SCK_PIN = 35;
+static const float FORCE_SIGN = 1.0f;          // Change to -1.0 if compression reads negative.
+static const float FORCE_GRAVITY = 9.80665f;
+static const float FORCE_FILTER_ALPHA = 0.35f; // Higher = faster response, lower = smoother.
+static const uint8_t FORCE_TARE_SAMPLES = 20;
+static const uint8_t FORCE_CAL_SAMPLES = 20;
+static const int FORCE_EEPROM_ADDR = 256;
+static const uint32_t FORCE_EEPROM_MAGIC = 0x465A4832UL;
+
+struct ForceCalibrationData {
+  uint32_t magic;
+  float scaleFactor;
+  long offset;
+};
+
+HX711 forceScale;
+ForceCalibrationData forceCal = {FORCE_EEPROM_MAGIC, 1.0f, 0};
+static bool forceReady = false;
+static bool forceCalibrated = false;
+static bool forceFilteredInitialized = false;
 static long forceRaw = 0;
 static float forceGram = 0.0f;
 static float forceNewton = 0.0f;
-static String forceStatus = "NO_DATA";
+static unsigned long forceLastReadMillis = 0;
+static uint32_t forceReadCount = 0;
+static uint32_t forceErrorCount = 0;
+static String forceStatus = "INIT";
 static String forceLastAck = "NONE";
-static uint32_t forceChecksumErrors = 0;
 
 
 // GLOBAL VARS //
@@ -2883,160 +2894,154 @@ int32_t modbusQuerry(String inData, int function) {
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// FORCE SENSOR RS485 CUSTOM PACKET
+// FORCE SENSOR HX711 DIRECT
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-uint8_t forceXorChecksum(const char *payload) {
-  uint8_t crc = 0;
-  while (*payload != '\0') {
-    crc ^= static_cast<uint8_t>(*payload++);
-  }
-  return crc;
+void saveForceCalibration() {
+  forceCal.magic = FORCE_EEPROM_MAGIC;
+  EEPROM.put(FORCE_EEPROM_ADDR, forceCal);
 }
 
-int forceHexValue(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return -1;
-}
-
-bool forceParseHexByte(const char *text, uint8_t &value) {
-  int high = forceHexValue(text[0]);
-  int low = forceHexValue(text[1]);
-  if (high < 0 || low < 0) {
+bool loadForceCalibration() {
+  ForceCalibrationData stored;
+  EEPROM.get(FORCE_EEPROM_ADDR, stored);
+  if (stored.magic != FORCE_EEPROM_MAGIC || !isfinite(stored.scaleFactor) || fabs(stored.scaleFactor) < 0.0001f) {
+    forceCal.magic = FORCE_EEPROM_MAGIC;
+    forceCal.scaleFactor = 1.0f;
+    forceCal.offset = 0;
     return false;
   }
-  value = static_cast<uint8_t>((high << 4) | low);
+
+  forceCal = stored;
   return true;
 }
 
-void forceSetTransmit(bool enabled) {
-  if (FORCE_RS485_DE_RE_PIN >= 0) {
-    digitalWrite(FORCE_RS485_DE_RE_PIN, enabled ? HIGH : LOW);
-  }
+void applyForceCalibration() {
+  forceScale.set_scale(forceCal.scaleFactor);
+  forceScale.set_offset(forceCal.offset);
+  forceCalibrated = fabs(forceCal.scaleFactor) >= 0.0001f;
 }
 
-void sendForceRs485Payload(const char *payload) {
-  char packet[128];
-  snprintf(packet, sizeof(packet), "$%s*%02X\n", payload, forceXorChecksum(payload));
-  forceSetTransmit(true);
-  delayMicroseconds(20);
-  Serial8.print(packet);
-  Serial8.flush();
-  delayMicroseconds(20);
-  forceSetTransmit(false);
+void initForceSensor() {
+  forceScale.begin(FORCE_HX711_DOUT_PIN, FORCE_HX711_SCK_PIN);
+  forceReady = true;
+  forceCalibrated = loadForceCalibration();
+  applyForceCalibration();
+  forceStatus = forceCalibrated ? "OK" : "UNCAL";
+  forceLastAck = forceCalibrated ? "CAL,LOADED" : "CAL,EMPTY";
 }
 
-void sendForceCommand(const String &command) {
-  char payload[96];
-  command.toCharArray(payload, sizeof(payload));
-  sendForceRs485Payload(payload);
-}
-
-String forceField(const String &payload, int fieldIndex) {
-  int start = 0;
-  int end = -1;
-  for (int i = 0; i <= fieldIndex; ++i) {
-    start = end + 1;
-    end = payload.indexOf(',', start);
-    if (end < 0) {
-      end = payload.length();
+bool forceWaitReady(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (!forceScale.is_ready()) {
+    if (millis() - start >= timeoutMs) {
+      forceErrorCount++;
+      forceStatus = "HX711_TIMEOUT";
+      return false;
     }
+    delay(1);
   }
-  return payload.substring(start, end);
+  return true;
 }
 
-void handleForcePayload(const char *payload) {
-  String data = String(payload);
-
-  if (data.startsWith("FZ,")) {
-    forceSeq = static_cast<uint32_t>(forceField(data, 1).toInt());
-    forceSensorMillis = static_cast<uint32_t>(forceField(data, 2).toInt());
-    forceRaw = forceField(data, 3).toInt();
-    forceGram = forceField(data, 4).toFloat();
-    forceNewton = forceField(data, 5).toFloat();
-    forceStatus = forceField(data, 6);
-    forceLastPacketMillis = millis();
-    forcePacketReady = true;
+void pollForceSensor() {
+  if (!forceReady || !forceScale.is_ready()) {
     return;
   }
 
-  if (data.startsWith("FACK,")) {
-    forceLastAck = data.substring(5);
-    forceLastPacketMillis = millis();
-    return;
+  forceRaw = forceScale.read();
+  float gram = FORCE_SIGN * (static_cast<float>(forceRaw - forceCal.offset) / forceCal.scaleFactor);
+
+  if (!forceFilteredInitialized) {
+    forceGram = gram;
+    forceFilteredInitialized = true;
+  } else {
+    forceGram += FORCE_FILTER_ALPHA * (gram - forceGram);
   }
+
+  forceNewton = forceGram * FORCE_GRAVITY / 1000.0f;
+  forceLastReadMillis = millis();
+  forceReadCount++;
+  forceStatus = forceCalibrated ? "OK" : "UNCAL";
 }
 
-void resetForceParser() {
-  forcePayloadLength = 0;
-  forceChecksumLength = 0;
-  forceFrameActive = false;
-  forceChecksumActive = false;
+bool tareForceSensor() {
+  if (!forceWaitReady(1000)) {
+    forceLastAck = "TARE,ERR,NO_HX711";
+    return false;
+  }
+
+  forceScale.tare(FORCE_TARE_SAMPLES);
+  forceCal.offset = forceScale.get_offset();
+  saveForceCalibration();
+  applyForceCalibration();
+  forceFilteredInitialized = false;
+  forceLastAck = "TARE,OK";
+  forceStatus = forceCalibrated ? "OK" : "UNCAL";
+  return true;
 }
 
-void handleForceFrame() {
-  forcePayloadBuffer[forcePayloadLength] = '\0';
-  forceChecksumBuffer[forceChecksumLength] = '\0';
-
-  uint8_t received = 0;
-  if (forceChecksumLength != 2 || !forceParseHexByte(forceChecksumBuffer, received)) {
-    forceChecksumErrors++;
-    return;
+bool calibrateForceSensor(float knownGram) {
+  if (fabs(knownGram) < 0.001f) {
+    forceLastAck = "CAL,ERR,BAD_GRAM";
+    return false;
   }
 
-  if (received != forceXorChecksum(forcePayloadBuffer)) {
-    forceChecksumErrors++;
-    return;
+  if (!forceWaitReady(1000)) {
+    forceLastAck = "CAL,ERR,NO_HX711";
+    return false;
   }
 
-  handleForcePayload(forcePayloadBuffer);
+  float value = forceScale.get_value(FORCE_CAL_SAMPLES);
+  float factor = value / (knownGram * FORCE_SIGN);
+  if (!isfinite(factor) || fabs(factor) < 0.0001f) {
+    forceLastAck = "CAL,ERR,BAD_FACTOR";
+    forceErrorCount++;
+    return false;
+  }
+
+  forceCal.scaleFactor = factor;
+  saveForceCalibration();
+  applyForceCalibration();
+  forceCalibrated = true;
+  forceFilteredInitialized = false;
+  forceLastAck = "CAL,OK," + String(forceCal.scaleFactor, 6);
+  forceStatus = "OK";
+  return true;
 }
 
-void pollForceSerial() {
-  while (Serial8.available() > 0) {
-    char c = static_cast<char>(Serial8.read());
-
-    if (c == '$') {
-      resetForceParser();
-      forceFrameActive = true;
-      continue;
-    }
-
-    if (!forceFrameActive) {
-      continue;
-    }
-
-    if (c == '\r') {
-      continue;
-    }
-
-    if (c == '\n') {
-      if (forceChecksumActive) {
-        handleForceFrame();
-      }
-      resetForceParser();
-      continue;
-    }
-
-    if (c == '*') {
-      forceChecksumActive = true;
-      continue;
-    }
-
-    if (forceChecksumActive) {
-      if (forceChecksumLength < sizeof(forceChecksumBuffer) - 1) {
-        forceChecksumBuffer[forceChecksumLength++] = c;
-      }
-    } else if (forcePayloadLength < sizeof(forcePayloadBuffer) - 1) {
-      forcePayloadBuffer[forcePayloadLength++] = c;
-    }
+bool setForceFactor(float factor) {
+  if (!isfinite(factor) || fabs(factor) < 0.0001f) {
+    forceLastAck = "FACTOR,ERR";
+    forceErrorCount++;
+    return false;
   }
+
+  forceCal.scaleFactor = factor;
+  saveForceCalibration();
+  applyForceCalibration();
+  forceCalibrated = true;
+  forceFilteredInitialized = false;
+  forceLastAck = "FACTOR,OK," + String(forceCal.scaleFactor, 6);
+  forceStatus = "OK";
+  return true;
+}
+
+void eraseForceCalibration() {
+  forceCal.magic = FORCE_EEPROM_MAGIC;
+  forceCal.scaleFactor = 1.0f;
+  forceCal.offset = 0;
+  saveForceCalibration();
+  applyForceCalibration();
+  forceCalibrated = false;
+  forceFilteredInitialized = false;
+  forceStatus = "UNCAL";
+  forceLastAck = "ERASE,OK";
 }
 
 void sendForceStatusToGui() {
-  unsigned long age = forcePacketReady ? millis() - forceLastPacketMillis : 0;
+  pollForceSensor();
+  unsigned long age = forceLastReadMillis > 0 ? millis() - forceLastReadMillis : 0;
   Serial.print("FZ,");
   Serial.print(forceRaw);
   Serial.print(",");
@@ -3050,7 +3055,7 @@ void sendForceStatusToGui() {
   Serial.print(",");
   Serial.print(forceLastAck);
   Serial.print(",");
-  Serial.println(forceChecksumErrors);
+  Serial.println(forceErrorCount);
 }
 void processSerial() {
   if (Serial.available() > 0 and cmdBuffer3 == "") {
@@ -3150,17 +3155,10 @@ void EstopProg() {
 void setup() {
   // run once:
   Serial.begin(9600);
-  Serial8.begin(FORCE_RS485_BAUD);  // Custom RS485 force sensor bus (pins 34 and 35)
+  initForceSensor();
   // There is no Serial.print before this line
   load_debug_from_eeprom();
   load_robot_id_from_eeprom();
-
-
-  // Serial8 is reserved for the custom RS485 force sensor link.
-  if (FORCE_RS485_DE_RE_PIN >= 0) {
-    pinMode(FORCE_RS485_DE_RE_PIN, OUTPUT);
-    forceSetTransmit(false);
-  }
 
   pinMode(J1stepPin, OUTPUT);
   pinMode(J1dirPin, OUTPUT);
@@ -3221,7 +3219,7 @@ void loop() {
   ////////////////////////////////////
   ///////////start loop///////////////
 
-  pollForceSerial();
+  pollForceSensor();
 
   if (splineEndReceived == false) {
     processSerial();
@@ -3251,8 +3249,7 @@ void loop() {
     }
 
     if (function == "FT") {
-      sendForceCommand("FCMD,TARE");
-      Serial.println("Force Tare Sent");
+      Serial.println(tareForceSensor() ? "Force Tare OK" : "Force Tare Error");
     }
 
     if (function == "FC") {
@@ -3261,8 +3258,7 @@ void loop() {
       if (knownGram == "") {
         Serial.println("Force Cal Error");
       } else {
-        sendForceCommand("FCMD,CAL," + knownGram);
-        Serial.println("Force Cal Sent");
+        Serial.println(calibrateForceSensor(knownGram.toFloat()) ? "Force Cal OK" : "Force Cal Error");
       }
     }
 
@@ -3272,24 +3268,18 @@ void loop() {
       if (factor == "") {
         Serial.println("Force Factor Error");
       } else {
-        sendForceCommand("FCMD,SETFACTOR," + factor);
-        Serial.println("Force Factor Sent");
+        Serial.println(setForceFactor(factor.toFloat()) ? "Force Factor OK" : "Force Factor Error");
       }
     }
 
     if (function == "FP") {
-      String enabled = inData;
-      enabled.trim();
-      if (enabled == "") {
-        enabled = "1";
-      }
-      sendForceCommand("FCMD,STREAM," + enabled);
-      Serial.println("Force Stream Sent");
+      forceLastAck = "STREAM,N/A";
+      Serial.println("Force Stream N/A");
     }
 
     if (function == "FE") {
-      sendForceCommand("FCMD,ERASE");
-      Serial.println("Force Erase Sent");
+      eraseForceCalibration();
+      Serial.println("Force Erase OK");
     }
 
     if (function == "DB") {
@@ -3300,6 +3290,7 @@ void loop() {
       help += "Example: DB[0] - Disable debug mode, don't change current persisted value\n\n";
 
 
+      
       int debugStart = inData.indexOf("[D]");
       int persistStart = inData.indexOf("[P]", persistStart + 3);
 
@@ -7194,4 +7185,7 @@ void loop() {
     shiftCMDarray();
   }
 }
+
+
+
 
