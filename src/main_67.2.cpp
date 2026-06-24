@@ -202,6 +202,20 @@ static uint32_t forceErrorCount = 0;
 static String forceStatus = "INIT";
 static String forceLastAck = "NONE";
 
+enum ForceControlMode : uint8_t {
+  FORCE_MODE_MONITOR = 0,
+  FORCE_MODE_POSITION = 1,
+  FORCE_MODE_FORCE = 2,
+  FORCE_MODE_HYBRID = 3
+};
+
+static ForceControlMode forceControlMode = FORCE_MODE_MONITOR;
+static float forceReferenceGram = 0.0f;
+static float forceReferenceToleranceGram = 50.0f;
+static bool forceReferenceArmed = false;
+static bool forceAlarmActive = false;
+static String forceAlarmText = "NONE";
+
 
 // GLOBAL VARS //
 
@@ -2922,15 +2936,102 @@ void applyForceCalibration() {
   forceCalibrated = fabs(forceCal.scaleFactor) >= 0.0001f;
 }
 
+void pollForceSensor();
+
+const char *forceModeName() {
+  switch (forceControlMode) {
+    case FORCE_MODE_POSITION: return "POSITION";
+    case FORCE_MODE_FORCE: return "FORCE";
+    case FORCE_MODE_HYBRID: return "HYBRID";
+    default: return "MONITOR";
+  }
+}
+
+void setForceStatusFromState() {
+  if (forceAlarmActive) {
+    forceStatus = "ALARM";
+  } else if (!forceCalibrated) {
+    forceStatus = "UNCAL";
+  } else {
+    forceStatus = "OK";
+  }
+}
+
 void initForceSensor() {
   forceScale.begin(FORCE_HX711_DOUT_PIN, FORCE_HX711_SCK_PIN);
   forceReady = true;
   forceCalibrated = loadForceCalibration();
   applyForceCalibration();
-  forceStatus = forceCalibrated ? "OK" : "UNCAL";
-  forceLastAck = forceCalibrated ? "CAL,LOADED" : "CAL,EMPTY";
+  setForceStatusFromState();
+  forceLastAck = forceCalibrated ? "CAL_LOADED" : "CAL_EMPTY";
 }
 
+bool setForceControlMode(uint8_t mode) {
+  if (mode > FORCE_MODE_HYBRID) {
+    forceLastAck = "MODE_ERR";
+    forceErrorCount++;
+    return false;
+  }
+
+  forceControlMode = static_cast<ForceControlMode>(mode);
+  forceLastAck = String("MODE_OK:") + forceModeName();
+  return true;
+}
+
+bool setForceReference(float referenceGram, float toleranceGram) {
+  if (!isfinite(referenceGram) || fabs(referenceGram) < 0.001f) {
+    forceLastAck = "REF_ERR_BAD_GRAM";
+    forceErrorCount++;
+    return false;
+  }
+
+  if (!isfinite(toleranceGram) || toleranceGram <= 0.0f) {
+    toleranceGram = max(fabs(referenceGram) * 0.05f, 5.0f);
+  }
+
+  forceReferenceGram = fabs(referenceGram);
+  forceReferenceToleranceGram = fabs(toleranceGram);
+  forceReferenceArmed = true;
+  forceAlarmActive = false;
+  forceAlarmText = "NONE";
+  setForceStatusFromState();
+  forceLastAck = "REF_OK";
+  return true;
+}
+
+bool checkForceReference() {
+  if (forceReferenceGram <= 0.0f) {
+    forceLastAck = "REF_ERR_EMPTY";
+    forceErrorCount++;
+    return false;
+  }
+
+  pollForceSensor();
+  float measuredGram = fabs(forceGram);
+  float errorGram = fabs(measuredGram - forceReferenceGram);
+  if (errorGram > forceReferenceToleranceGram) {
+    forceAlarmActive = true;
+    forceAlarmText = String("REF_DIFF:") + String(errorGram, 2) + "g";
+    forceLastAck = String("REF_ALARM:") + String(measuredGram, 2) + "g";
+    forceErrorCount++;
+    setForceStatusFromState();
+    return false;
+  }
+
+  forceAlarmActive = false;
+  forceAlarmText = "NONE";
+  forceLastAck = String("REF_OK:") + String(measuredGram, 2) + "g";
+  setForceStatusFromState();
+  return true;
+}
+
+void clearForceReferenceAlarm() {
+  forceReferenceArmed = false;
+  forceAlarmActive = false;
+  forceAlarmText = "NONE";
+  forceLastAck = "ALARM_CLEAR";
+  setForceStatusFromState();
+}
 bool forceWaitReady(unsigned long timeoutMs) {
   unsigned long start = millis();
   while (!forceScale.is_ready()) {
@@ -2962,12 +3063,22 @@ void pollForceSensor() {
   forceNewton = forceGram * FORCE_GRAVITY / 1000.0f;
   forceLastReadMillis = millis();
   forceReadCount++;
-  forceStatus = forceCalibrated ? "OK" : "UNCAL";
-}
+  setForceStatusFromState();
 
+  if (forceReferenceArmed) {
+    float measuredGram = fabs(forceGram);
+    float errorGram = fabs(measuredGram - forceReferenceGram);
+    if (errorGram > forceReferenceToleranceGram) {
+      forceAlarmActive = true;
+      forceAlarmText = String("REF_DIFF:") + String(errorGram, 2) + "g";
+      forceErrorCount++;
+      setForceStatusFromState();
+    }
+  }
+}
 bool tareForceSensor() {
   if (!forceWaitReady(1000)) {
-    forceLastAck = "TARE,ERR,NO_HX711";
+    forceLastAck = "TARE_ERR_NO_HX711";
     return false;
   }
 
@@ -2976,26 +3087,26 @@ bool tareForceSensor() {
   saveForceCalibration();
   applyForceCalibration();
   forceFilteredInitialized = false;
-  forceLastAck = "TARE,OK";
-  forceStatus = forceCalibrated ? "OK" : "UNCAL";
+  forceLastAck = "TARE_OK";
+  setForceStatusFromState();
   return true;
 }
 
 bool calibrateForceSensor(float knownGram) {
   if (fabs(knownGram) < 0.001f) {
-    forceLastAck = "CAL,ERR,BAD_GRAM";
+    forceLastAck = "CAL_ERR_BAD_GRAM";
     return false;
   }
 
   if (!forceWaitReady(1000)) {
-    forceLastAck = "CAL,ERR,NO_HX711";
+    forceLastAck = "CAL_ERR_NO_HX711";
     return false;
   }
 
   float value = forceScale.get_value(FORCE_CAL_SAMPLES);
   float factor = value / (knownGram * FORCE_SIGN);
   if (!isfinite(factor) || fabs(factor) < 0.0001f) {
-    forceLastAck = "CAL,ERR,BAD_FACTOR";
+    forceLastAck = "CAL_ERR_BAD_FACTOR";
     forceErrorCount++;
     return false;
   }
@@ -3005,14 +3116,18 @@ bool calibrateForceSensor(float knownGram) {
   applyForceCalibration();
   forceCalibrated = true;
   forceFilteredInitialized = false;
-  forceLastAck = "CAL,OK," + String(forceCal.scaleFactor, 6);
-  forceStatus = "OK";
+  forceReferenceGram = fabs(knownGram);
+  forceReferenceToleranceGram = max(forceReferenceGram * 0.05f, 5.0f);
+  forceAlarmActive = false;
+  forceAlarmText = "NONE";
+  forceLastAck = "CAL_OK:" + String(forceCal.scaleFactor, 6);
+  setForceStatusFromState();
   return true;
 }
 
 bool setForceFactor(float factor) {
   if (!isfinite(factor) || fabs(factor) < 0.0001f) {
-    forceLastAck = "FACTOR,ERR";
+    forceLastAck = "FACTOR_ERR";
     forceErrorCount++;
     return false;
   }
@@ -3022,8 +3137,8 @@ bool setForceFactor(float factor) {
   applyForceCalibration();
   forceCalibrated = true;
   forceFilteredInitialized = false;
-  forceLastAck = "FACTOR,OK," + String(forceCal.scaleFactor, 6);
-  forceStatus = "OK";
+  forceLastAck = "FACTOR_OK:" + String(forceCal.scaleFactor, 6);
+  setForceStatusFromState();
   return true;
 }
 
@@ -3035,8 +3150,8 @@ void eraseForceCalibration() {
   applyForceCalibration();
   forceCalibrated = false;
   forceFilteredInitialized = false;
-  forceStatus = "UNCAL";
-  forceLastAck = "ERASE,OK";
+  setForceStatusFromState();
+  forceLastAck = "ERASE_OK";
 }
 
 void sendForceStatusToGui() {
@@ -3055,7 +3170,15 @@ void sendForceStatusToGui() {
   Serial.print(",");
   Serial.print(forceLastAck);
   Serial.print(",");
-  Serial.println(forceErrorCount);
+  Serial.print(forceErrorCount);
+  Serial.print(",");
+  Serial.print(forceModeName());
+  Serial.print(",");
+  Serial.print(forceReferenceGram, 2);
+  Serial.print(",");
+  Serial.print(forceReferenceToleranceGram, 2);
+  Serial.print(",");
+  Serial.println(forceAlarmText);
 }
 void processSerial() {
   if (Serial.available() > 0 and cmdBuffer3 == "") {
@@ -3272,8 +3395,30 @@ void loop() {
       }
     }
 
+    if (function == "FM") {
+      inData.trim();
+      Serial.println(setForceControlMode(static_cast<uint8_t>(inData.toInt())) ? "Force Mode OK" : "Force Mode Error");
+    }
+
+    if (function == "FR") {
+      inData.trim();
+      int comma = inData.indexOf(',');
+      float referenceGram = comma >= 0 ? inData.substring(0, comma).toFloat() : inData.toFloat();
+      float toleranceGram = comma >= 0 ? inData.substring(comma + 1).toFloat() : 0.0f;
+      Serial.println(setForceReference(referenceGram, toleranceGram) ? "Force Ref OK" : "Force Ref Error");
+    }
+
+    if (function == "FK") {
+      Serial.println(checkForceReference() ? "Force Ref Check OK" : "Force Ref Check Error");
+    }
+
+    if (function == "FD") {
+      clearForceReferenceAlarm();
+      Serial.println("Force Alarm Clear OK");
+    }
+
     if (function == "FP") {
-      forceLastAck = "STREAM,N/A";
+      forceLastAck = "STREAM_NA";
       Serial.println("Force Stream N/A");
     }
 
@@ -3281,7 +3426,6 @@ void loop() {
       eraseForceCalibration();
       Serial.println("Force Erase OK");
     }
-
     if (function == "DB") {
       String help = "Command DB - Set Debug Parameters\n";
       help += "required [D] - Debug State 0/1 (off/on) Enables / Disabled Serial Debug Mode\n";
@@ -7185,6 +7329,9 @@ void loop() {
     shiftCMDarray();
   }
 }
+
+
+
 
 
 
