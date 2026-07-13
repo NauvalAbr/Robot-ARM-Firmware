@@ -57,8 +57,6 @@
 // 4.4 - 3/2/24 added kinematic error handling
 // 4.5 - 6/29/24 simplified drive motors functions with arrays
 // 5.0 - 7/14/24 updated kinematics
-// 5.1 - 2/15/25 Modbus option
-// 5.2 - 6/7/25 Modbus option
 // 6.0 - 6/7/25 Virtual Robot
 // 6.1 - 8/29/25 updated accel and decel, auto calibrate & microsteps
 // 6.2 - 8/29/25 changed bootstrap theme, xbox upgrade
@@ -83,7 +81,6 @@ const char *FIRMWARE_VERSION = "6.7.1";
 #include <SPI.h>
 #include <SD.h>
 #include <stdexcept>
-#include <ModbusMaster.h>
 #include <EEPROM.h>
 #include "HX711.h"
 #pragma GCC diagnostic ignored "-Warray-bounds"
@@ -150,6 +147,7 @@ const int J8calPin = 37;
 const int J9calPin = 38;
 
 const int EstopPin = 39;
+const int EstopActiveState = HIGH;  // NC wiring: normal closed to GND, pressed/open = HIGH
 
 
 //set encoder multiplier
@@ -168,8 +166,6 @@ Encoder J3encPos(19, 18);
 Encoder J4encPos(20, 21);
 Encoder J5encPos(23, 22);
 Encoder J6encPos(40, 41); //24, 25
-
-ModbusMaster node;
 
 // Direct HX711 force sensor on Teensy. Keep the HX711 module at 3.3 V logic for Teensy pins.
 static const uint8_t FORCE_HX711_DOUT_PIN = 34;
@@ -272,11 +268,11 @@ float J9axisLim = J9axisLimPos + J9axisLimNeg;
 
 //motor steps per degree
 float J1StepDeg = 88.888;
-float J2StepDeg = 111.111;
+float J2StepDeg = 222.222;
 float J3StepDeg = 111.111;
-float J4StepDeg = 99.555;
-float J5StepDeg = 43.720;
-float J6StepDeg = 44.444;
+float J4StepDeg = 199.111;
+float J5StepDeg = 87.440;
+float J6StepDeg = 88.888;
 float J7StepDeg = 14.2857;
 float J8StepDeg = 14.2857;
 float J9StepDeg = 14.2857;
@@ -424,7 +420,7 @@ bool rndTrue;
 float rndSpeed;
 bool splineTrue;
 bool splineEndReceived;
-bool estopActive;
+volatile bool estopActive;
 
 float Xtool = 0;
 float Ytool = 0;
@@ -436,12 +432,12 @@ float RXtool = 0;
 //DENAVIT HARTENBERG PARAMETERS
 
 float DHparams[6][4] = {
-  { 0, 0, 169.77, 0 },
-  { -90, -90, 0, 64.2 },
-  { 0, 0, 0, 305 },
-  { 0, -90, 222.63, 0 },
-  { 0, 90, 0, 0 },
-  { 180, -90, 41, 0 }
+  { 0,      0,   160,     0    },
+  { -90,  -90,    0,      64.2 },
+  { 0,      0,    0,      305  },
+  { 0,    -90,   223.5,   0    },
+  { 0,     90,    0,      0    },
+  { 180,  -90,    46,     0    }
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2826,81 +2822,6 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
 
 
 
-int32_t modbusQuerry(String inData, int function) {
-  int32_t result;
-  int32_t response;
-  int32_t response2;
-  int slaveIdIndex = inData.indexOf('A');
-  int MBaddressIndex = inData.indexOf('B');
-  int MBvalIndex = inData.indexOf('C');
-  int SlaveID = inData.substring(slaveIdIndex + 1, MBaddressIndex).toInt();
-  int MBaddress = inData.substring(MBaddressIndex + 1, MBvalIndex).toInt();
-  int MBval = inData.substring(MBvalIndex + 1).toInt();
-  node = ModbusMaster();
-  node.begin(SlaveID, Serial8);
-
-  if (function == 1) {
-    result = node.readCoils(MBaddress, 1);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 2) {
-    result = node.readDiscreteInputs(MBaddress, 1);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 3) {
-    result = node.readHoldingRegisters(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 4) {
-    result = node.readInputRegisters(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 15) {
-    result = node.writeSingleCoil(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = 1;
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 6) {
-    result = node.writeSingleRegister(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = 1;
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else {
-    response = -1;
-    return response;
-  }
-}
-
-
-
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //READ DATA
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3264,9 +3185,20 @@ void shiftCMDarray() {
 
 
 void EstopProg() {
-  estopActive = true;
-  flag = "EB";
-  sendRobotPos();
+  if (digitalRead(EstopPin) == EstopActiveState) {
+    estopActive = true;
+    flag = "EB";
+  }
+}
+
+bool abortIfEstop() {
+  if (estopActive) {
+    flag = "EB";
+    Serial.println(flag);
+    inData = "";
+    return true;
+  }
+  return false;
 }
 
 
@@ -3313,7 +3245,7 @@ void setup() {
   pinMode(J9calPin, INPUT_PULLUP);
 
   pinMode(EstopPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(EstopPin), EstopProg, LOW);
+  attachInterrupt(digitalPinToInterrupt(EstopPin), EstopProg, CHANGE);
 
   digitalWrite(J1stepPin, HIGH);
   digitalWrite(J2stepPin, HIGH);
@@ -3350,7 +3282,12 @@ void loop() {
   //dont start unless at least one command has been read in
   if (cmdBuffer1 != "") {
     //process data
-    estopActive = false;
+    estopActive = (digitalRead(EstopPin) == EstopActiveState);
+    if (estopActive) {
+      Serial.println("EB");
+      cmdBuffer1 = "";
+      return;
+    }
     inData = cmdBuffer1;
     inData.trim();
     String function = inData.substring(0, 2);
@@ -3523,194 +3460,6 @@ void loop() {
       DEBUG_PRINTLN(asset_tag);
 
       handle_set_robot_id_command(robot_model, robot_version, driver_board, serial_number, asset_tag);
-    }
-
-    //-----MODBUS READ HOLDING REGISTER - FUNCTION 03--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BA") {
-      int32_t result = modbusQuerry(inData, 3);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ COIL - FUNCTION 01--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BB") {
-      int32_t result = modbusQuerry(inData, 1);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ INPUT - FUNCTION 02--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BC") {
-      int32_t result = modbusQuerry(inData, 2);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ HOLDING REGISTER - FUNCTION 03--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BH") {
-      int32_t result = modbusQuerry(inData, 3);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ INPUT REGISTER - FUNCTION 04--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BD") {
-      int32_t result = modbusQuerry(inData, 4);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS WRITE COIL - FUNCTION 15--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BE") {
-      int32_t result = modbusQuerry(inData, 15);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("Write Success");
-      }
-    }
-
-    //-----MODBUS WRITE REGISTER - FUNCTION 6--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BF") {
-      int32_t result = modbusQuerry(inData, 6);
-      if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("Write Success");
-      }
-    }
-
-    //-----QUERRY DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MQ") {
-      uint8_t result;
-      int16_t highRegister;
-
-      // Modbus read
-      result = node.readHoldingRegisters(0x1207, 2);
-
-      if (result == node.ku8MBSuccess) {
-
-        highRegister = node.getResponseBuffer(0);
-        Serial.println(highRegister);
-
-      } else {
-        Serial.println("Modbus error: ");
-        //Serial.println(result, HEX);
-      }
-
-      delay(1000);
-    }
-
-    //-----HOME MOTOR DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "HD") {
-      uint8_t result;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x020D;  // P0213 - DI3
-      uint16_t registerAddress2 = 0x020C;  // P0212 - DI2
-      //uint16_t registerAddress = 0x1207;  // P1807 - absolute position counter
-      uint16_t valueOn = 1;   // Value to write to the register
-      uint16_t valueOff = 0;  // Value to write to the register
-
-      // Write the value to the register
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress2, valueOn);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress1, valueOff);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress2, valueOff);
-
-      if (result == node.ku8MBSuccess) {
-        Serial.println("Write successful");
-      } else {
-        //Serial.println("Modbus Error: ");
-        Serial.println(result, HEX);
-      }
-
-      delay(50);
-    }
-
-    //-----RESET DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "RR") {
-      uint8_t result;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x020D;  // P0213 - DI3 INPUT
-      uint16_t registerAddress2 = 0x0203;  // P0203 - DI3 FUNCTION SELECTION
-
-      uint16_t valueOn = 1;
-      uint16_t valueOff = 0;
-      uint16_t homingMode = 33;
-      uint16_t resetMode = 2;
-
-
-      result = node.writeSingleRegister(registerAddress2, resetMode);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress2, homingMode);
-      delay(50);
-
-
-      if (result == node.ku8MBSuccess) {
-        Serial.println("Write successful");
-      } else {
-        Serial.println("fail");
-      }
-
-      delay(50);
-    }
-
-    //-----RESET DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "FR") {
-      uint8_t result;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x0B01;  // P1101 - fault reset
-
-      uint16_t valueOn = 1;
-      uint16_t valueOff = 0;
-
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
-      result = node.writeSingleRegister(registerAddress1, valueOff);
-      delay(50);
-
-
-      if (result == node.ku8MBSuccess) {
-        Serial.println("Write successful");
-      } else {
-        Serial.println("fail");
-      }
-
-      delay(50);
     }
 
     //-----SPLINE START------------------------------------------------------
@@ -4187,89 +3936,6 @@ void loop() {
       Serial.println("Done");
     }
 
-    //-----COMMAND TO WAIT MODBUS COIL---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WJ") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int timoutIndex = inData.indexOf('D');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1, timoutIndex).toInt();
-      int timeout = inData.substring(timoutIndex + 1).toInt();
-      unsigned long timeoutMillis = timeout * 1000;
-      unsigned long startTime = millis();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while ((millis() - startTime < timeoutMillis) && (result != value)) {
-        result = modbusQuerry(MBquery, 1);
-        delay(100);
-      }
-      delay(5);
-      Serial.print("Done");
-    }
-
-    //-----COMMAND TO WAIT MODBUS INPUT---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WK") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int timoutIndex = inData.indexOf('D');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1, timoutIndex).toInt();
-      int timeout = inData.substring(timoutIndex + 1).toInt();
-      unsigned long timeoutMillis = timeout * 1000;
-      unsigned long startTime = millis();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while ((millis() - startTime < timeoutMillis) && (result != value)) {
-        result = modbusQuerry(MBquery, 2);
-        delay(100);
-      }
-      delay(5);
-      Serial.print("Done");
-    }
-
-    //-----COMMAND TO SET MODBUS COIL---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SC") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1).toInt();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
-      result = modbusQuerry(MBquery, 15);
-      delay(5);
-      Serial.println(result);
-    }
-
-    //-----COMMAND TO SET MODBUS OUTPUT REGISTER---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SO") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1).toInt();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
-      result = modbusQuerry(MBquery, 6);
-      delay(5);
-      Serial.println(result);
-    }
-
-
     //-----COMMAND SEND POSITION---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "SP") {
@@ -4416,16 +4082,19 @@ void loop() {
       //DRIVE TO LIMITS FAST
       SpeedIn = 25;
       driveLimit(JStep, SpeedIn);
+      if (abortIfEstop()) return;
 
       //Backoff 
       backOff(J1req, J2req, J3req, J4req, J5req,
         J6req, J7req, J8req, J9req,
         5,      // speed
         700);   // steps
+      if (abortIfEstop()) return;
 
       //DRIVE TO LIMITS MED
       SpeedIn = 2;
       driveLimit(JStep, SpeedIn);
+      if (abortIfEstop()) return;
 
 
 
@@ -4582,7 +4251,9 @@ void loop() {
       float SpeedVal = 100;
       float ACCramp = 50;
 
+      if (abortIfEstop()) return;
       driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+      if (abortIfEstop()) return;
       sendRobotPos();
       inData = "";  // Clear recieved buffer
     }
